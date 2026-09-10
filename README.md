@@ -9,7 +9,6 @@ Features
 * Focus mode that shows one selected group while keeping other tabs open
 
 ## Tech Stack
-Technologies
 * JavaScript
 * HTML
 * CSS
