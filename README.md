@@ -12,27 +12,12 @@ Features
 
 1. Download or clone this repository.
 ```bash
-git clone
+git clone https://github.com/jonathanquach21/Vertical-Tabs-Extension.git
+cd chrome-vertical-tabs-manager
 ```
-Open Chrome and go to chrome://extensions.
-
-Turn on Developer mode.
-
-Click Load unpacked.
-
-Select the project folder containing manifest.json.
-
-Click the extension icon to open the Side Panel.
-
-Usage
-
-Click a group name to focus that group in Chrome.
-
-Click Show all to restore the other tabs.
-
-While a group is focused, use the plus button or Ctrl+T/Cmd+T to create a tab inside that group.
-
-Right-click a tab or group to open its available actions.
-
-Open Settings to customize the theme, colors, font, search placement, tab dates, and new-tab button.
+2. Open Chrome and go to chrome://extensions.
+3. Turn on Developer mode.
+4. Click Load unpacked.
+5. Select the project folder containing manifest.json.
+6. Click the extension icon to open the Side Panel.
 
