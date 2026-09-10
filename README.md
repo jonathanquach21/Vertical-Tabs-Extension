@@ -2,40 +2,18 @@
 Chrome extension for vertical tabs, tab groups, focus mode, and faster tab management.
 Features
 
-Native Chrome Side Panel for persistent vertical tab management
+## Features
+* Default, Tabs, and Groups views
+* Create, rename, delete, restore, and recolor custom tab groups
+* Drag and drop tabs and groups to organize them in a custom order
+* Focus mode that shows one selected group while keeping other tabs open
 
-Default, Tabs, and Groups views
+## Installation
 
-Create, rename, delete, restore, and recolor custom tab groups
-
-Drag and drop tabs and groups to organize them in a custom order
-
-Focus mode that shows one selected group while keeping other tabs open
-
-Hidden groups dropdown for quickly switching between groups in focus mode
-
-Group-aware new tabs from the plus button, Ctrl+T, and Cmd+T
-
-Search tabs by title or URL
-
-Sort tabs by custom order, newest, oldest, or alphabetical order
-
-Right-click controls for rename, mute, reload, bookmark, duplicate, pin, close, and move-to-group actions
-
-Loading, audio, muted, and tab count indicators
-
-Custom group colors, font size, font color, theme, and tab-time display
-
-Deleted-group restore history with a clear-history option
-
-Separate regular and incognito tab/group state
-
-Default extension shortcut: Alt+V on Windows/Linux and Option+V on macOS
-
-Installation
-
-Download or clone this repository.
-
+1. Download or clone this repository.
+```bash
+git clone
+```
 Open Chrome and go to chrome://extensions.
 
 Turn on Developer mode.
