@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Vertical Tabs Sidebar",
-  "version": "1.1.6",
+  "version": "1.1.8",
   "description": "A clean vertical tab sidebar with custom groups, themes, search, and a configurable shortcut.",
   "incognito": "split",
   "permissions": ["tabs", "storage", "scripting", "bookmarks", "sidePanel", "tabGroups"],
@@ -25,12 +25,12 @@
     "128": "icons/icon128.png"
   },
   "commands": {
-    "toggle-sidebar": {
+    "activate-extension": {
       "suggested_key": {
         "default": "Alt+V",
         "mac": "Option+V"
       },
-      "description": "Activate the extension shortcut"
+      "description": "Activate the extension"
     }
   },
   "side_panel": {
