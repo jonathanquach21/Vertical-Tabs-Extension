@@ -32,11 +32,17 @@ let tabNames = {}; // tabId -> sidebar-only label
 let tabCreatedAt = {}; // tabId -> timestamp used for newest/oldest sorting
 let layoutOrder = []; // mixed top-level order: tab:<id> and group:<id>
 let deletedGroups = []; // most recently deleted custom groups for this context
+// Chrome tab IDs are only valid for the current browser session. These
+// records let us reconnect saved groups/layout entries to the new IDs Chrome
+// assigns when it restores tabs after a restart.
+let tabRecords = {}; // stable record key -> { key, tabId, url, title, ... }
 // windowId -> active group focus and the original native tab-group snapshot.
 // This remains stored until the user chooses "Show all".
 let browserFocusSnapshots = {};
 const browserFocusQueues = new Map();
 const sidebarOpenByWindow = {}; // windowId -> boolean
+let persistQueue = Promise.resolve();
+let startupReconcileTimer = null;
 
 // ---------- storage ----------
 const stateReady = (async function loadState() {
@@ -46,9 +52,15 @@ const stateReady = (async function loadState() {
     // These are retained only as a one-time migration source for the old
     // single shared state format.
     "groups", "groupOrder", "tabNames", "tabCreatedAt",
-    "layoutOrder", "browserFocusSnapshots"
+    "layoutOrder", "deletedGroups", "tabRecords", "browserFocusSnapshots"
   ]);
-  if (stored.settings) settings = { ...DEFAULT_SETTINGS, ...stored.settings };
+  if (stored.settings) {
+    settings = {
+      ...DEFAULT_SETTINGS,
+      ...stored.settings,
+      shortcut: { ...DEFAULT_SETTINGS.shortcut, ...(stored.settings.shortcut || {}) }
+    };
+  }
   const scoped = stored[CONTEXT_STORAGE_KEY];
   const legacy = !scoped ? stored : {};
   if (scoped?.groups && typeof scoped.groups === "object") groups = scoped.groups;
@@ -66,6 +78,8 @@ const stateReady = (async function loadState() {
   deletedGroups = Array.isArray(scoped?.deletedGroups)
     ? scoped.deletedGroups
     : Array.isArray(legacy.deletedGroups) ? legacy.deletedGroups : [];
+  if (scoped?.tabRecords && typeof scoped.tabRecords === "object") tabRecords = scoped.tabRecords;
+  else if (legacy.tabRecords && typeof legacy.tabRecords === "object") tabRecords = legacy.tabRecords;
   if (scoped?.browserFocusSnapshots && typeof scoped.browserFocusSnapshots === "object") {
     browserFocusSnapshots = scoped.browserFocusSnapshots;
   } else if (legacy.browserFocusSnapshots && typeof legacy.browserFocusSnapshots === "object") {
@@ -80,7 +94,7 @@ const stateReady = (async function loadState() {
       const currentIds = new Set(currentTabs.map((tab) => tab.id));
       for (const group of Object.values(groups)) {
         group.tabIds = Array.isArray(group.tabIds)
-          ? group.tabIds.filter((id) => currentIds.has(id))
+          ? group.tabIds.filter((id) => currentIds.has(Number(id)))
           : [];
         group.incognito = IS_INCOGNITO_CONTEXT;
       }
@@ -91,28 +105,58 @@ const stateReady = (async function loadState() {
         if (!currentIds.has(Number(id))) delete tabCreatedAt[id];
       }
       for (const deletedGroup of deletedGroups) {
-        deletedGroup.tabIds = deletedGroup.tabIds.filter((id) => currentIds.has(id));
+        deletedGroup.tabIds = Array.isArray(deletedGroup.tabIds)
+          ? deletedGroup.tabIds.filter((id) => currentIds.has(Number(id)))
+          : [];
         deletedGroup.incognito = IS_INCOGNITO_CONTEXT;
       }
     } catch (e) {}
   }
+  normalizeGroups();
+  normalizeTabRecords();
   normalizeLayoutOrder();
   normalizeGroupOrder();
   normalizeDeletedGroups();
+
+  // Reconcile as soon as the worker starts. The first query normally contains
+  // Chrome's restored session tabs; the delayed pass handles browsers that
+  // finish restoring a window in several batches.
+  try {
+    const currentTabs = await chrome.tabs.query({});
+    if (reconcileStoredTabIds(currentTabs)) await persist();
+    scheduleStartupReconciliation();
+  } catch (e) {}
 })();
 function persist() {
-  chrome.storage.local.set({
-    settings,
+  normalizeGroups();
+  normalizeTabRecords();
+  normalizeGroupOrder();
+  normalizeLayoutOrder();
+  normalizeDeletedGroups();
+  const payload = {
+    settings: cloneState(settings),
     [CONTEXT_STORAGE_KEY]: {
-      groups,
-      groupOrder,
-      tabNames,
-      tabCreatedAt,
-      layoutOrder,
-      deletedGroups,
-      browserFocusSnapshots
+      groups: cloneState(groups),
+      groupOrder: cloneState(groupOrder),
+      tabNames: cloneState(tabNames),
+      tabCreatedAt: cloneState(tabCreatedAt),
+      layoutOrder: cloneState(layoutOrder),
+      deletedGroups: cloneState(deletedGroups),
+      tabRecords: cloneState(tabRecords),
+      browserFocusSnapshots: cloneState(browserFocusSnapshots)
     }
-  });
+  };
+  // Queue writes and return the promise so message/event handlers can keep the
+  // service worker alive until the latest organization is actually stored.
+  const nextWrite = persistQueue.catch(() => {}).then(() => chrome.storage.local.set(payload));
+  persistQueue = nextWrite.catch(() => {});
+  return nextWrite;
+}
+
+function cloneState(value) {
+  try { return structuredClone(value); } catch (e) {
+    try { return JSON.parse(JSON.stringify(value)); } catch (error) { return value; }
+  }
 }
 
 // ---------- helpers ----------
@@ -127,6 +171,380 @@ function normalizeLayoutOrder() {
     seen.add(token);
     return true;
   });
+}
+
+function normalizeGroups() {
+  if (!groups || typeof groups !== "object") groups = {};
+  for (const [key, group] of Object.entries(groups)) {
+    if (!group || typeof group !== "object") {
+      delete groups[key];
+      continue;
+    }
+    group.id = String(group.id || key);
+    group.name = String(group.name || "Unnamed group");
+    group.color = String(group.color || "#5b6eff");
+    group.tabIds = Array.from(new Set(
+      (Array.isArray(group.tabIds) ? group.tabIds : [])
+        .map(Number)
+        .filter(Number.isInteger)
+    ));
+    group.collapsed = group.collapsed === true;
+    group.incognito = IS_INCOGNITO_CONTEXT;
+  }
+}
+
+function normalizeTabRecords() {
+  if (!tabRecords || typeof tabRecords !== "object") tabRecords = {};
+  const normalized = {};
+  for (const [key, value] of Object.entries(tabRecords)) {
+    if (!value || typeof value !== "object") continue;
+    const recordKey = String(value.key || key);
+    const tabId = Number(value.tabId);
+    normalized[recordKey] = {
+      ...value,
+      key: recordKey,
+      tabId: Number.isInteger(tabId) ? tabId : null,
+      url: String(value.url || ""),
+      title: String(value.title || ""),
+      originalTitle: String(value.originalTitle || value.title || ""),
+      incognito: value.incognito === true,
+      windowId: Number.isInteger(Number(value.windowId)) ? Number(value.windowId) : null,
+      index: Number.isInteger(Number(value.index)) ? Number(value.index) : null,
+      createdAt: Number(value.createdAt) || 0
+    };
+  }
+  tabRecords = normalized;
+}
+
+function makeTabRecordKey() {
+  return `t_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function tabIdentityUrl(tab) {
+  return String(tab?.url || tab?.pendingUrl || "").trim();
+}
+
+function tabIdentityTitle(tab) {
+  return String(tab?.title || "").trim();
+}
+
+function findTabRecordById(tabId) {
+  const id = Number(tabId);
+  if (!Number.isInteger(id)) return null;
+  return Object.values(tabRecords)
+    .filter((record) => Number(record.tabId) === id && record.incognito === IS_INCOGNITO_CONTEXT)
+    .sort((a, b) => Number(b.lastMatchedAt || 0) - Number(a.lastMatchedAt || 0))[0] || null;
+}
+
+function upsertTabRecord(tab) {
+  const tabId = Number(tab?.id);
+  if (!Number.isInteger(tabId)) return false;
+  let record = findTabRecordById(tabId);
+  if (!record) {
+    const key = makeTabRecordKey();
+    record = {
+      key,
+      tabId,
+      url: "",
+      title: "",
+      originalTitle: "",
+      incognito: IS_INCOGNITO_CONTEXT,
+      windowId: null,
+      index: null,
+      createdAt: 0,
+      lastMatchedAt: 0
+    };
+    tabRecords[key] = record;
+  }
+
+  const nextUrl = tabIdentityUrl(tab);
+  const nextTitle = tabIdentityTitle(tab);
+  const nextOriginalTitle = String(tab?.title || tab?.url || "New Tab");
+  const nextWindowId = Number.isInteger(tab?.windowId) ? tab.windowId : null;
+  const nextIndex = Number.isInteger(tab?.index) ? tab.index : null;
+  const nextCreatedAt = Number(tabCreatedAt[String(tabId)]) || Number(record.createdAt) ||
+    Number(tab?.lastAccessed) || Date.now();
+  const changed = record.tabId !== tabId ||
+    record.url !== nextUrl ||
+    record.title !== nextTitle ||
+    record.originalTitle !== nextOriginalTitle ||
+    record.windowId !== nextWindowId ||
+    record.index !== nextIndex ||
+    Number(record.createdAt) !== nextCreatedAt;
+
+  record.tabId = tabId;
+  record.url = nextUrl;
+  record.title = nextTitle;
+  record.originalTitle = nextOriginalTitle;
+  record.incognito = IS_INCOGNITO_CONTEXT;
+  record.windowId = nextWindowId;
+  record.index = nextIndex;
+  record.createdAt = nextCreatedAt;
+  record.lastMatchedAt = Date.now();
+  delete record.closedAt;
+  tabCreatedAt[String(tabId)] = nextCreatedAt;
+  return changed;
+}
+
+function collectReferencedTabIds() {
+  const ids = new Set();
+  for (const group of Object.values(groups)) {
+    for (const tabId of Array.isArray(group.tabIds) ? group.tabIds : []) {
+      if (Number.isInteger(Number(tabId))) ids.add(Number(tabId));
+    }
+  }
+  for (const tabId of Object.keys(tabNames)) {
+    if (Number.isInteger(Number(tabId))) ids.add(Number(tabId));
+  }
+  for (const tabId of Object.keys(tabCreatedAt)) {
+    if (Number.isInteger(Number(tabId))) ids.add(Number(tabId));
+  }
+  for (const token of layoutOrder) {
+    const match = /^tab:(-?\d+)$/.exec(String(token));
+    if (match) ids.add(Number(match[1]));
+  }
+  for (const snapshot of Object.values(browserFocusSnapshots)) {
+    if (Number.isInteger(Number(snapshot?.activeTabId))) ids.add(Number(snapshot.activeTabId));
+    for (const entry of Array.isArray(snapshot?.tabs) ? snapshot.tabs : []) {
+      if (Number.isInteger(Number(entry?.id))) ids.add(Number(entry.id));
+    }
+  }
+  return ids;
+}
+
+function recordMatchesTab(record, tab, referencedIds) {
+  if (!record || record.incognito !== !!tab?.incognito) return -Infinity;
+  const recordId = Number(record.tabId);
+  const tabId = Number(tab?.id);
+  const recordUrl = String(record.url || "");
+  const currentUrl = tabIdentityUrl(tab);
+  const recordTitle = String(record.title || record.originalTitle || "");
+  const currentTitle = tabIdentityTitle(tab);
+  const sameUrl = !!recordUrl && !!currentUrl && recordUrl === currentUrl;
+  const sameTitle = !!recordTitle && !!currentTitle && recordTitle === currentTitle;
+  const sameIdAndWindow = recordId === tabId && Number(record.windowId) === Number(tab.windowId);
+
+  // An exact URL is the reliable cross-restart signal. A same-ID,
+  // same-window match also preserves a tab that navigated while the worker
+  // was asleep.
+  if (!sameUrl && !sameIdAndWindow && !(sameTitle && !recordUrl && !currentUrl)) return -Infinity;
+
+  let score = 0;
+  if (sameUrl) score += 600;
+  if (sameTitle) score += 120;
+  if (sameIdAndWindow) score += 300;
+  if (referencedIds.has(recordId)) score += 180;
+  if (Number(record.windowId) === Number(tab.windowId)) score += 30;
+  if (Number.isInteger(record.index) && Number.isInteger(tab.index)) {
+    score -= Math.min(120, Math.abs(record.index - tab.index));
+  }
+  return score;
+}
+
+function remapTabId(tabId, idMap) {
+  if (tabId === null || tabId === undefined || tabId === "") return null;
+  const numericId = Number(tabId);
+  return idMap.has(numericId) ? idMap.get(numericId) : numericId;
+}
+
+function remapIdArray(ids, idMap, currentIds, pruneStale) {
+  const result = [];
+  const seen = new Set();
+  for (const value of Array.isArray(ids) ? ids : []) {
+    const id = remapTabId(value, idMap);
+    if (!Number.isInteger(id) || (pruneStale && !currentIds.has(id)) || seen.has(id)) continue;
+    seen.add(id);
+    result.push(id);
+  }
+  return result;
+}
+
+function remapStoredTabNames(idMap, currentIds, pruneStale) {
+  const next = {};
+  for (const [oldId, name] of Object.entries(tabNames)) {
+    const id = remapTabId(oldId, idMap);
+    if (!Number.isInteger(id) || (pruneStale && !currentIds.has(id))) continue;
+    if (!Object.prototype.hasOwnProperty.call(next, String(id)) || id === Number(oldId)) {
+      next[String(id)] = name;
+    }
+  }
+  tabNames = next;
+}
+
+function remapStoredCreatedAt(idMap, currentIds, pruneStale) {
+  const next = {};
+  for (const [oldId, createdAt] of Object.entries(tabCreatedAt)) {
+    const id = remapTabId(oldId, idMap);
+    if (!Number.isInteger(id) || (pruneStale && !currentIds.has(id))) continue;
+    if (!Object.prototype.hasOwnProperty.call(next, String(id)) || id === Number(oldId)) {
+      next[String(id)] = Number(createdAt) || Date.now();
+    }
+  }
+  tabCreatedAt = next;
+}
+
+function remapLayoutTabTokens(idMap, currentIds, pruneStale) {
+  layoutOrder = layoutOrder
+    .map((token) => {
+      const match = /^tab:(-?\d+)$/.exec(String(token));
+      if (!match) return token;
+      const id = remapTabId(Number(match[1]), idMap);
+      if (!Number.isInteger(id) || (pruneStale && !currentIds.has(id))) return null;
+      return layoutToken("tab", id);
+    })
+    .filter(Boolean);
+}
+
+function remapSnapshots(idMap, currentTabs, currentIds, pruneStale) {
+  const currentById = new Map(currentTabs.map((tab) => [Number(tab.id), tab]));
+  const nextSnapshots = {};
+  for (const snapshot of Object.values(browserFocusSnapshots)) {
+    if (!snapshot || typeof snapshot !== "object") continue;
+    const mappedTabs = (Array.isArray(snapshot.tabs) ? snapshot.tabs : [])
+      .map((entry) => ({
+        ...entry,
+        id: remapTabId(entry.id, idMap)
+      }))
+      .filter((entry) => Number.isInteger(Number(entry.id)) && (!pruneStale || currentIds.has(Number(entry.id))));
+    const activeTabId = remapTabId(snapshot.activeTabId, idMap);
+    const windowCounts = new Map();
+    for (const entry of mappedTabs) {
+      const tab = currentById.get(Number(entry.id));
+      if (!tab) continue;
+      windowCounts.set(tab.windowId, (windowCounts.get(tab.windowId) || 0) + 1);
+    }
+    const targetWindowId = Array.from(windowCounts.entries())
+      .sort((a, b) => b[1] - a[1])[0]?.[0];
+    if (targetWindowId === undefined || !mappedTabs.length) continue;
+    nextSnapshots[String(targetWindowId)] = {
+      ...snapshot,
+      windowId: targetWindowId,
+      activeTabId,
+      tabs: mappedTabs
+    };
+  }
+  browserFocusSnapshots = nextSnapshots;
+}
+
+function reconcileStoredTabIds(currentTabs, { pruneStale = false } = {}) {
+  normalizeGroups();
+  normalizeTabRecords();
+  const tabs = (Array.isArray(currentTabs) ? currentTabs : [])
+    .filter((tab) => Number.isInteger(Number(tab?.id)))
+    .map((tab) => ({ ...tab, id: Number(tab.id) }))
+    .sort((a, b) => Number(a.windowId) - Number(b.windowId) || Number(a.index) - Number(b.index));
+  const currentIds = new Set(tabs.map((tab) => tab.id));
+  const referencedIds = collectReferencedTabIds();
+  const records = Object.values(tabRecords);
+  const usedRecords = new Set();
+  const assignments = new Map();
+  const idMap = new Map();
+
+  for (const tab of tabs) {
+    let best = null;
+    let bestScore = -Infinity;
+    for (const record of records) {
+      if (usedRecords.has(record.key)) continue;
+      const score = recordMatchesTab(record, tab, referencedIds);
+      if (score > bestScore) {
+        best = record;
+        bestScore = score;
+      }
+    }
+    // 250 allows an exact URL match without requiring a title, while still
+    // rejecting unrelated records left behind by an old browser session.
+    if (best && bestScore >= 250) {
+      usedRecords.add(best.key);
+      assignments.set(tab.id, best);
+      const oldId = Number(best.tabId);
+      if (Number.isInteger(oldId)) idMap.set(oldId, tab.id);
+    }
+  }
+
+  const nextRecords = {};
+  for (const record of records) {
+    if (!usedRecords.has(record.key) && !pruneStale) {
+      nextRecords[record.key] = record;
+    }
+  }
+  for (const tab of tabs) {
+    let record = assignments.get(tab.id);
+    if (!record) {
+      const key = makeTabRecordKey();
+      record = {
+        key,
+        tabId: tab.id,
+        url: "",
+        title: "",
+        originalTitle: "",
+        incognito: IS_INCOGNITO_CONTEXT,
+        windowId: null,
+        index: null,
+        createdAt: 0,
+        lastMatchedAt: 0
+      };
+    }
+    record.tabId = tab.id;
+    record.url = tabIdentityUrl(tab);
+    record.title = tabIdentityTitle(tab);
+    record.originalTitle = String(tab.title || tab.url || "New Tab");
+    record.incognito = IS_INCOGNITO_CONTEXT;
+    record.windowId = Number.isInteger(tab.windowId) ? tab.windowId : null;
+    record.index = Number.isInteger(tab.index) ? tab.index : null;
+    record.createdAt = Number(tabCreatedAt[String(tab.id)]) || Number(record.createdAt) ||
+      Number(tab.lastAccessed) || Date.now();
+    record.lastMatchedAt = Date.now();
+    delete record.closedAt;
+    tabCreatedAt[String(tab.id)] = record.createdAt;
+    nextRecords[record.key] = record;
+  }
+  tabRecords = nextRecords;
+
+  remapStoredTabNames(idMap, currentIds, pruneStale);
+  remapStoredCreatedAt(idMap, currentIds, pruneStale);
+  remapLayoutTabTokens(idMap, currentIds, pruneStale);
+  for (const group of Object.values(groups)) {
+    group.tabIds = remapIdArray(group.tabIds, idMap, currentIds, pruneStale);
+  }
+  for (const deletedGroup of deletedGroups) {
+    deletedGroup.tabIds = remapIdArray(deletedGroup.tabIds, idMap, currentIds, pruneStale);
+  }
+  remapSnapshots(idMap, tabs, currentIds, pruneStale);
+
+  if (pruneStale) {
+    for (const groupId of Object.keys(groups)) {
+      if (!groups[groupId].tabIds.length) {
+        delete groups[groupId];
+        groupOrder = groupOrder.filter((id) => id !== groupId);
+        layoutOrder = layoutOrder.filter((token) => token !== layoutToken("group", groupId));
+      }
+    }
+  }
+  normalizeGroupOrder();
+  normalizeLayoutOrder();
+  normalizeDeletedGroups();
+  return true;
+}
+
+function scheduleStartupReconciliation() {
+  if (startupReconcileTimer) clearTimeout(startupReconcileTimer);
+  startupReconcileTimer = setTimeout(async () => {
+    startupReconcileTimer = null;
+    try {
+      const currentTabs = await chrome.tabs.query({});
+      reconcileStoredTabIds(currentTabs, { pruneStale: true });
+      await persist();
+      const windowIds = Array.from(new Set(currentTabs
+        .map((tab) => tab.windowId)
+        .filter((id) => Number.isInteger(id))));
+      for (const windowId of windowIds) {
+        // If a group was focused before the restart, recreate the temporary
+        // hidden-tab group after Chrome has finished restoring its tabs.
+        await enforceBrowserGroupFocus(windowId);
+        await refreshWindow(windowId);
+      }
+    } catch (e) {}
+  }, 1500);
 }
 
 function ensureLayoutTokens(tabs = []) {
@@ -157,6 +575,7 @@ async function getTabsForWindow(windowId) {
   const tabs = await chrome.tabs.query({ windowId });
   tabs.sort((a, b) => a.index - b.index);
   let createdAtChanged = false;
+  let recordsChanged = false;
   for (const tab of tabs) {
     const key = String(tab.id);
     if (!tabCreatedAt[key]) {
@@ -165,8 +584,9 @@ async function getTabsForWindow(windowId) {
       tabCreatedAt[key] = Number(tab.lastAccessed) || Date.now();
       createdAtChanged = true;
     }
+    if (upsertTabRecord(tab)) recordsChanged = true;
   }
-  if (createdAtChanged) persist();
+  if (createdAtChanged || recordsChanged) await persist();
   return tabs.map((t) => ({
     id: t.id,
     title: tabNames[String(t.id)] || t.title || t.url || "New Tab",
@@ -235,7 +655,7 @@ async function updateActionIndicator(windowId, tabs) {
 async function refreshWindow(windowId) {
   if (windowId === undefined || windowId === chrome.windows.WINDOW_ID_NONE) return;
   const tabs = await getTabsForWindow(windowId);
-  if (ensureLayoutTokens(tabs)) persist();
+  if (ensureLayoutTokens(tabs)) await persist();
   updateActionIndicator(windowId, tabs);
   normalizeGroupOrder();
   normalizeLayoutOrder();
@@ -248,29 +668,10 @@ async function refreshWindow(windowId) {
 
 function pruneGroupsOfTabId(tabId) {
   let changed = false;
-  delete tabNames[String(tabId)];
-  delete tabCreatedAt[String(tabId)];
-  const token = layoutToken("tab", tabId);
-  layoutOrder = layoutOrder.filter((item) => item !== token);
-  for (const g of Object.values(groups)) {
-    const idx = g.tabIds.indexOf(tabId);
-    if (idx !== -1) {
-      g.tabIds.splice(idx, 1);
+  for (const [recordKey, record] of Object.entries(tabRecords)) {
+    if (Number(record.tabId) === Number(tabId)) {
+      record.closedAt = Date.now();
       changed = true;
-    }
-  }
-  for (const deletedGroup of deletedGroups) {
-    if (Array.isArray(deletedGroup.tabIds)) {
-      deletedGroup.tabIds = deletedGroup.tabIds.filter((id) => id !== tabId);
-    }
-  }
-  normalizeDeletedGroups();
-  // drop empty groups
-  for (const gid of Object.keys(groups)) {
-    if (groups[gid].tabIds.length === 0) {
-      delete groups[gid];
-      groupOrder = groupOrder.filter((id) => id !== gid);
-      layoutOrder = layoutOrder.filter((item) => item !== layoutToken("group", gid));
     }
   }
   return changed;
@@ -287,6 +688,11 @@ function normalizeGroupOrder() {
 function normalizeDeletedGroups() {
   deletedGroups = (Array.isArray(deletedGroups) ? deletedGroups : [])
     .filter((item) => item && typeof item === "object" && item.id !== undefined && Array.isArray(item.tabIds))
+    .map((item) => ({
+      ...item,
+      tabIds: Array.from(new Set(item.tabIds.map(Number).filter(Number.isInteger))),
+      incognito: IS_INCOGNITO_CONTEXT
+    }))
     .slice(0, 20);
 }
 
@@ -440,7 +846,7 @@ async function restoreBrowserGroupFocusUnlocked(windowId) {
   }
 
   delete browserFocusSnapshots[key];
-  persist();
+  await persist();
   return { ok: true };
 }
 
@@ -481,7 +887,7 @@ async function focusBrowserGroupUnlocked(windowId, customGroupId, requestedTabId
 
   const snapshot = await captureBrowserFocusSnapshot(windowId, customGroupId);
   browserFocusSnapshots[key] = snapshot;
-  persist();
+  await persist();
 
   const nativeGroups = await chrome.tabGroups.query({ windowId });
   for (const nativeGroup of nativeGroups) {
@@ -513,7 +919,7 @@ async function focusBrowserGroupUnlocked(windowId, customGroupId, requestedTabId
         color: "grey",
         collapsed: true
       });
-      persist();
+      await persist();
     } catch (e) {
       // The sidebar still filters its own list if Chrome cannot create the temporary group.
     }
@@ -574,7 +980,7 @@ async function enforceBrowserGroupFocusUnlocked(windowId) {
       }
     }
     await chrome.tabGroups.update(groupId, { collapsed: true });
-    persist();
+    await persist();
   } catch (e) {}
 }
 
@@ -647,7 +1053,10 @@ if (chrome.sidePanel?.onClosed) {
 }
 
 chrome.commands.onCommand.addListener(async (command) => {
-  if (command !== "toggle-sidebar") return;
+  // The public command is intentionally named "Activate the extension" so
+  // Chrome's shortcut settings show Option+V/Alt+V on the correct row.
+  // Keep the old key as a compatibility alias for already-loaded builds.
+  if (command !== "activate-extension" && command !== "toggle-sidebar") return;
   const tab = await getActiveTab();
   if (!tab) return;
   toggleForTab(tab);
@@ -657,11 +1066,19 @@ chrome.action.onClicked.addListener((tab) => {
   toggleForTab(tab);
 });
 
-chrome.windows.onRemoved.addListener((windowId) => {
+chrome.windows.onRemoved.addListener(async (windowId) => {
   delete sidebarOpenByWindow[windowId];
   delete browserFocusSnapshots[String(windowId)];
-  persist();
+  try { await persist(); } catch (e) {}
 });
+
+if (chrome.runtime.onStartup) {
+  chrome.runtime.onStartup.addListener(() => {
+    // stateReady schedules the delayed pass. Keep this event as a second
+    // trigger for Chrome versions that restore the session after onStartup.
+    stateReady.then(() => scheduleStartupReconciliation()).catch(() => {});
+  });
+}
 
 // ---------- live tab tracking ----------
 function addCreatedTabToFocusedGroup(tab) {
@@ -696,7 +1113,7 @@ chrome.tabs.onCreated.addListener((tab) => {
     if (tab?.id !== undefined) {
       tabCreatedAt[String(tab.id)] = Date.now();
       addCreatedTabToFocusedGroup(tab);
-      persist();
+      await persist();
     }
     if (windowId !== undefined) {
       // Adopt browser-created tabs (Ctrl+T/Cmd+T) before rebuilding the
@@ -708,8 +1125,12 @@ chrome.tabs.onCreated.addListener((tab) => {
 });
 chrome.tabs.onRemoved.addListener((tabId, info) => {
   pruneGroupsOfTabId(tabId);
-  persist();
-  refreshWindow(info.windowId);
+  persist().catch(() => {});
+  // Give Chrome a chance to restore the session before removing the saved
+  // membership. On a normal tab close this cleans up shortly afterward; on a
+  // browser restart it lets the next startup reconciliation reconnect the tab.
+  scheduleStartupReconciliation();
+  refreshWindow(info.windowId).catch(() => {});
 });
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.title || changeInfo.favIconUrl || changeInfo.status || changeInfo.url || changeInfo.pinned || changeInfo.audible || changeInfo.mutedInfo || changeInfo.groupId) {
@@ -743,6 +1164,7 @@ async function handleMessage(msg, sender) {
   switch (msg.type) {
     case "REQUEST_STATE": {
       const tabs = windowId !== undefined ? await getTabsForWindow(windowId) : [];
+      if (ensureLayoutTokens(tabs)) await persist();
       return {
         open: !!sidebarOpenByWindow[windowId],
         tabs,
@@ -831,7 +1253,7 @@ async function handleMessage(msg, sender) {
         if (!targetGroup.tabIds.some((id) => Number(id) === newTabId)) {
           targetGroup.tabIds.push(newTabId);
         }
-        persist();
+        await persist();
         if (windowId !== undefined) {
           await broadcastToWindow(windowId, {
             type: "GROUPS_UPDATED", groups, groupOrder, layoutOrder,
@@ -887,7 +1309,7 @@ async function handleMessage(msg, sender) {
         const name = String(msg.name || "").trim().slice(0, 120);
         if (name) tabNames[String(id)] = name;
         else delete tabNames[String(id)];
-        persist();
+        await persist();
         if (windowId !== undefined) refreshWindow(windowId);
       }
       return { ok: true };
@@ -918,7 +1340,7 @@ async function handleMessage(msg, sender) {
       layoutOrder.push(layoutToken("group", id));
       normalizeLayoutOrder();
       normalizeGroupOrder();
-      persist();
+      await persist();
       if (windowId !== undefined) broadcastToWindow(windowId, {
         type: "GROUPS_UPDATED", groups, groupOrder, layoutOrder,
         focusedGroupId: browserFocusSnapshots[String(windowId)]?.customGroupId || null
@@ -931,7 +1353,7 @@ async function handleMessage(msg, sender) {
       if (g) {
         Object.assign(g, msg.patch);
         normalizeGroupOrder();
-        persist();
+        await persist();
         if (windowId !== undefined) broadcastToWindow(windowId, {
           type: "GROUPS_UPDATED", groups, groupOrder, layoutOrder,
           focusedGroupId: browserFocusSnapshots[String(windowId)]?.customGroupId || null
@@ -963,7 +1385,7 @@ async function handleMessage(msg, sender) {
       delete groups[msg.groupId];
       groupOrder = groupOrder.filter((id) => id !== msg.groupId);
       layoutOrder = layoutOrder.filter((item) => item !== layoutToken("group", msg.groupId));
-      persist();
+      await persist();
       if (windowId !== undefined) broadcastToWindow(windowId, {
         type: "GROUPS_UPDATED", groups, groupOrder, layoutOrder,
         deletedGroups,
@@ -1018,7 +1440,7 @@ async function handleMessage(msg, sender) {
       normalizeGroupOrder();
       normalizeLayoutOrder();
       normalizeDeletedGroups();
-      persist();
+      await persist();
       if (windowId !== undefined) broadcastToWindow(windowId, {
         type: "GROUPS_UPDATED", groups, groupOrder, layoutOrder,
         deletedGroups,
@@ -1029,7 +1451,7 @@ async function handleMessage(msg, sender) {
 
     case "CLEAR_DELETED_GROUP_HISTORY": {
       deletedGroups = [];
-      persist();
+      await persist();
       await broadcastAll({
         type: "GROUPS_UPDATED",
         groups,
@@ -1051,7 +1473,7 @@ async function handleMessage(msg, sender) {
           layoutOrder = layoutOrder.filter((item) => item !== layoutToken("group", gid));
         }
       }
-      persist();
+      await persist();
       if (windowId !== undefined) broadcastToWindow(windowId, {
         type: "GROUPS_UPDATED", groups, groupOrder, layoutOrder,
         focusedGroupId: browserFocusSnapshots[String(windowId)]?.customGroupId || null
@@ -1077,7 +1499,7 @@ async function handleMessage(msg, sender) {
         for (const tid of movingIds) {
           if (!g.tabIds.some((id) => Number(id) === tid)) g.tabIds.push(tid);
         }
-        persist();
+        await persist();
         if (windowId !== undefined) broadcastToWindow(windowId, {
           type: "GROUPS_UPDATED", groups, groupOrder, layoutOrder,
           focusedGroupId: browserFocusSnapshots[String(windowId)]?.customGroupId || null
@@ -1094,7 +1516,7 @@ async function handleMessage(msg, sender) {
         for (const id of valid) {
           if (!g.tabIds.includes(id)) g.tabIds.push(id);
         }
-        persist();
+        await persist();
         if (windowId !== undefined) broadcastToWindow(windowId, {
           type: "GROUPS_UPDATED", groups, groupOrder, layoutOrder,
           focusedGroupId: browserFocusSnapshots[String(windowId)]?.customGroupId || null
@@ -1108,7 +1530,7 @@ async function handleMessage(msg, sender) {
         groupOrder = msg.groupOrder;
         normalizeGroupOrder();
         syncGroupTokensToGroupOrder();
-        persist();
+        await persist();
         if (windowId !== undefined) broadcastToWindow(windowId, {
           type: "GROUPS_UPDATED", groups, groupOrder, layoutOrder,
           focusedGroupId: browserFocusSnapshots[String(windowId)]?.customGroupId || null
@@ -1121,7 +1543,7 @@ async function handleMessage(msg, sender) {
       if (Array.isArray(msg.layoutOrder)) {
         layoutOrder = msg.layoutOrder.filter((token) => typeof token === "string");
         normalizeLayoutOrder();
-        persist();
+        await persist();
         if (windowId !== undefined) broadcastToWindow(windowId, {
           type: "TABS_UPDATED",
           tabs: await getTabsForWindow(windowId),
@@ -1136,7 +1558,7 @@ async function handleMessage(msg, sender) {
 
     case "SETTINGS_CHANGED": {
       settings = { ...settings, ...msg.settings };
-      persist();
+      await persist();
       broadcastAll({ type: "SETTINGS_UPDATED", settings });
       return { ok: true };
     }

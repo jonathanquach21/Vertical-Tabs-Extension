@@ -152,7 +152,7 @@
           </div>
           <div class="vt-popover-row">
             <div class="vt-popover-label">Side bar shortcut</div>
-            <div class="vt-shortcut-hint"><a href="chrome://extensions/shortcuts" target="_blank" rel="noopener" class="vt-shortcut-link">Activate the extension shortcut</a></div>
+            <div class="vt-shortcut-hint"><a href="chrome://extensions/shortcuts" target="_blank" rel="noopener" class="vt-shortcut-link">Activate the extension</a></div>
             <div class="vt-shortcut-status" aria-live="polite"></div>
           </div>
         </div>
